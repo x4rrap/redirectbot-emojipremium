@@ -89,6 +89,7 @@ DEFAULT_LINK = (
     "✅ <b>Link pronto!</b>\n\n"
     "📌 Gruppo: <b>{gruppo}</b>\n"
     "⏳ Valido per <b>{minuti} minuti</b>\n"
+    "{modo}"
     "💥 Questo messaggio si autodistrugge tra <b>{secondi} secondi</b>."
 )
 DEFAULT_SETTINGS = {
@@ -100,7 +101,8 @@ DEFAULT_SETTINGS = {
     "delete_delay": "45",     # secondi prima che il messaggio col link sparisca
     "member_limit": "1",      # utenti max per link (0 = illimitato)
     "cooldown": "8",          # secondi tra una richiesta link e l'altra
-    "join_request": "0",      # 1 = il link richiede approvazione (auto-approvata dal bot)
+    "join_request": "1",      # 1 = richiesta di ingresso: NESSUNA auto-accettazione, approvi tu
+    "notify_user": "1",       # 1 = avvisa l'utente quando accetti/rifiuti la richiesta
 }
 
 # Impostazioni numeriche modificabili: chiave -> (etichetta, minimo, massimo)
@@ -184,7 +186,11 @@ class DB:
         CREATE TABLE IF NOT EXISTS links(
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, group_id INTEGER,
             chat_id INTEGER, link TEXT, expire INTEGER, created INTEGER,
-            revoked INTEGER DEFAULT 0);
+            revoked INTEGER DEFAULT 0, jr INTEGER DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS join_requests(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, user_id INTEGER,
+            first_name TEXT, username TEXT, group_id INTEGER, link TEXT,
+            created INTEGER, status TEXT DEFAULT 'pending', handled INTEGER DEFAULT 0);
         CREATE TABLE IF NOT EXISTS deletions(
             id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER,
             message_id INTEGER, due INTEGER);
@@ -194,9 +200,14 @@ class DB:
         CREATE INDEX IF NOT EXISTS idx_del_due ON deletions(due);
         CREATE INDEX IF NOT EXISTS idx_links_exp ON links(revoked, expire);
         CREATE INDEX IF NOT EXISTS idx_sess_user ON session_msgs(user_id);
+        CREATE INDEX IF NOT EXISTS idx_jr ON join_requests(status, created);
         """
         with self.lock:
             self.conn.executescript(schema)
+            # migrazione per database creati con versioni precedenti
+            cols = [r["name"] for r in self.conn.execute("PRAGMA table_info(links)")]
+            if "jr" not in cols:
+                self.conn.execute("ALTER TABLE links ADD COLUMN jr INTEGER DEFAULT 0")
 
     # ---- settings ----
     def get(self, key: str) -> str:
@@ -325,10 +336,10 @@ class DB:
         return [r["user_id"] for r in self.all("SELECT user_id FROM users WHERE banned=0 AND blocked=0")]
 
     # ---- link ----
-    def link_log(self, user_id, group_id, chat_id, link, expire):
+    def link_log(self, user_id, group_id, chat_id, link, expire, jr=0):
         self.exe(
-            "INSERT INTO links(user_id,group_id,chat_id,link,expire,created) VALUES(?,?,?,?,?,?)",
-            (user_id, group_id, chat_id, link, expire, now()),
+            "INSERT INTO links(user_id,group_id,chat_id,link,expire,created,jr) VALUES(?,?,?,?,?,?,?)",
+            (user_id, group_id, chat_id, link, expire, now(), jr),
         )
         self.exe(
             "UPDATE users SET last_link=?, links=links+1 WHERE user_id=?", (now(), user_id)
@@ -339,7 +350,7 @@ class DB:
 
     def links_expired(self, t: int):
         return self.all(
-            "SELECT id,chat_id,link FROM links WHERE revoked=0 AND expire<=? LIMIT 50", (t,)
+            "SELECT id,chat_id,link FROM links WHERE revoked=0 AND jr=0 AND expire<=? LIMIT 50", (t,)
         )
 
     def links_active(self):
@@ -347,6 +358,46 @@ class DB:
 
     def link_revoked(self, lid: int):
         self.exe("UPDATE links SET revoked=1 WHERE id=?", (lid,))
+
+    def link_get(self, link: str):
+        return self.one("SELECT * FROM links WHERE link=?", (link,))
+
+    def links_jr_close(self, t: int):
+        """I link in modalità richiesta NON vengono revocati: le richieste in attesa restano valide."""
+        self.exe("UPDATE links SET revoked=1 WHERE revoked=0 AND jr=1 AND expire<=?", (t,))
+
+    # ---- richieste di ingresso (approvazione MANUALE) ----
+    def jr_add(self, chat_id, user_id, first_name, username, group_id, link):
+        r = self.one(
+            "SELECT id FROM join_requests WHERE chat_id=? AND user_id=? AND status='pending'",
+            (chat_id, user_id),
+        )
+        if r:
+            self.exe("UPDATE join_requests SET created=?, link=? WHERE id=?", (now(), link, r["id"]))
+            return r["id"], False
+        rid = self.exe(
+            "INSERT INTO join_requests(chat_id,user_id,first_name,username,group_id,link,created) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (chat_id, user_id, first_name, username, group_id, link, now()),
+        )
+        return rid, True
+
+    def jr_get(self, rid: int):
+        return self.one("SELECT * FROM join_requests WHERE id=?", (rid,))
+
+    def jr_pending(self, limit: int = 8):
+        return self.all(
+            "SELECT * FROM join_requests WHERE status='pending' ORDER BY created LIMIT ?", (limit,)
+        )
+
+    def jr_pending_all(self):
+        return self.jr_pending(500)
+
+    def jr_pending_count(self) -> int:
+        return self.one("SELECT COUNT(*) c FROM join_requests WHERE status='pending'")["c"]
+
+    def jr_set(self, rid: int, status: str):
+        self.exe("UPDATE join_requests SET status=?, handled=? WHERE id=?", (status, now(), rid))
 
     # ---- code eliminazione ----
     def del_schedule(self, chat_id: int, message_id: int, due: int):
@@ -407,7 +458,7 @@ class DB:
         with self.lock:
             for t in (
                 "settings", "emojis", "groups", "buttons", "users",
-                "links", "deletions", "session_msgs",
+                "links", "deletions", "session_msgs", "join_requests",
             ):
                 self.conn.execute(f"DELETE FROM {t}")
             with suppress(Exception):
@@ -598,6 +649,7 @@ async def worker():
                 except TelegramAPIError:
                     pass
                 db.link_revoked(row["id"])
+            db.links_jr_close(t)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -697,7 +749,7 @@ async def create_invite(group, user_id: int):
         if limit > 0:
             kwargs["member_limit"] = limit
     inv = await tg(bot.create_chat_invite_link, **kwargs)
-    return inv.invite_link, expire
+    return inv.invite_link, expire, bool(kwargs.get("creates_join_request"))
 
 
 async def deliver_link(user, gid: int, cb: CallbackQuery = None):
@@ -722,7 +774,7 @@ async def deliver_link(user, gid: int, cb: CallbackQuery = None):
         return await answer(f"⏳ Attendi {wait}s prima di richiedere un altro link.", True)
 
     try:
-        url, expire = await create_invite(group, uid)
+        url, expire, jr_mode = await create_invite(group, uid)
     except TelegramAPIError as e:
         log.error("Creazione link fallita per gruppo %s: %s", group["chat_id"], e)
         await answer("⚠️ Servizio temporaneamente non disponibile.", True)
@@ -732,23 +784,28 @@ async def deliver_link(user, gid: int, cb: CallbackQuery = None):
         )
         return
 
-    db.link_log(uid, group["id"], group["chat_id"], url, expire)
+    db.link_log(uid, group["id"], group["chat_id"], url, expire, jr=1 if jr_mode else 0)
     db.group_click(group["id"])
     await answer()
 
     delay = max(3, db.geti("delete_delay"))
+    modo = (
+        "🛂 Premi il bottone e invia la richiesta: verrai aggiunto <b>manualmente</b> dall'admin.\n"
+        if jr_mode else ""
+    )
     text = render(
         db.get("link_text") or DEFAULT_LINK,
         nome=esc(user.first_name),
         gruppo=esc(group["label"]),
         minuti=db.geti("link_minutes"),
         secondi=delay,
+        modo=modo,
     )
 
     def builder(plain: bool):
         return InlineKeyboardMarkup(
             inline_keyboard=[
-                [mk_btn("Entra nel gruppo", url=url, emoji_name="join", style="success", plain=plain)]
+                [mk_btn("Richiedi accesso" if jr_mode else "Entra nel gruppo", url=url, emoji_name="join", style="success", plain=plain)]
             ]
         )
 
@@ -785,12 +842,40 @@ async def h_go(cb: CallbackQuery):
     await deliver_link(cb.from_user, gid, cb)
 
 
+def jr_keyboard(rid: int) -> InlineKeyboardMarkup:
+    return ikb([[("✅ Accetta", f"jr:ok:{rid}"), ("❌ Rifiuta", f"jr:no:{rid}")]])
+
+
 @user_router.chat_join_request()
 async def h_join_request(req: ChatJoinRequest):
+    """NON accetta mai in automatico: salva la richiesta e avvisa l'admin con Accetta/Rifiuta."""
     link = req.invite_link.invite_link if req.invite_link else None
-    if link and db.link_known(link):
+    row = db.link_get(link) if link else None
+    if not row:
+        log.info("Richiesta da un link non creato dal bot (chat %s): ignorata", req.chat.id)
+        return
+    u = req.from_user
+    group = db.group_by_chat(req.chat.id)
+    label = group["label"] if group else (req.chat.title or str(req.chat.id))
+    rid, is_new = db.jr_add(
+        req.chat.id, u.id, u.first_name or "", u.username or "",
+        group["id"] if group else 0, link,
+    )
+    if not is_new:
+        return
+    full = " ".join(filter(None, [u.first_name, u.last_name])) or str(u.id)
+    text = (
+        "📥 <b>Nuova richiesta di ingresso</b>\n\n"
+        f'👤 <a href="tg://user?id={u.id}">{esc(full)}</a>'
+        + (f" (@{esc(u.username)})" if u.username else "")
+        + f"\n🆔 <code>{u.id}</code>\n📂 Gruppo: <b>{esc(label)}</b>\n"
+        f"⏳ In attesa in totale: <b>{db.jr_pending_count()}</b>\n\n"
+        "Decidi tu: la richiesta resta in sospeso finché non premi un bottone."
+    )
+    for aid in ADMIN_IDS:
         with suppress(TelegramAPIError):
-            await req.approve()
+            await bot.send_message(aid, text, reply_markup=jr_keyboard(rid))
+    log.info("Richiesta #%s da %s per chat %s (in attesa di approvazione manuale)", rid, u.id, req.chat.id)
 
 
 @user_router.my_chat_member()
@@ -830,13 +915,16 @@ def home_text() -> str:
         f"👥 Utenti: <b>{s['users']}</b>  (nuovi 24h: {s['new24']})\n"
         f"🔗 Link generati: <b>{s['links']}</b>  (24h: {s['links24']})\n"
         f"📂 Gruppi attivi: <b>{s['groups']}</b>\n"
+        f"📥 Richieste in attesa: <b>{db.jr_pending_count()}</b>\n"
         f"😀 Emoji premium salvate: <b>{s['emojis']}</b>\n\n"
         "Scegli una sezione:"
     )
 
 
 def kb_home():
+    n = db.jr_pending_count()
     return ikb([
+        [(f"📥 Richieste ({n})" if n else "📥 Richieste", "adm:reqs")],
         [("👥 Gruppi", "adm:groups"), ("🔘 Bottoni", "adm:btns")],
         [("📝 Contenuti", "adm:content"), ("😀 Emoji premium", "adm:emo")],
         [("⚙️ Impostazioni", "adm:set"), ("📊 Statistiche", "adm:stats")],
@@ -1120,7 +1208,7 @@ def content_view():
         "📝 <b>CONTENUTI</b>\n\n"
         f"🖼 Foto benvenuto: {wp}\n🖼 Foto messaggio link: {lp}\n\n"
         "Nei testi puoi usare: <code>{nome}</code> <code>{gruppo}</code> <code>{minuti}</code> "
-        "<code>{secondi}</code> e le emoji premium (incollale direttamente o usa <code>{e:nome}</code>).\n"
+        "<code>{secondi}</code> <code>{modo}</code> e le emoji premium (incollale direttamente o usa <code>{e:nome}</code>).\n"
         "La formattazione (grassetto, corsivo, ecc.) viene mantenuta."
     )
     rows = [
@@ -1160,7 +1248,7 @@ async def a_txt(cb: CallbackQuery, state: FSMContext):
     await cb.message.answer(
         f"✏️ <b>{TEXT_META[key]}</b>\n\nInvia il nuovo testo. Puoi usare grassetto, corsivo, "
         "link e <b>emoji premium</b> direttamente: il loro ID viene salvato in automatico.\n"
-        "Variabili: <code>{nome} {gruppo} {minuti} {secondi}</code>\n\n/cancel per annullare"
+        "Variabili: <code>{nome} {gruppo} {minuti} {secondi} {modo}</code>\n\n/cancel per annullare"
     )
 
 
@@ -1300,11 +1388,13 @@ def settings_view():
         f"🗑 Auto-eliminazione messaggio link: <b>{db.geti('delete_delay')}</b> s\n"
         f"👤 Max utenti per link: <b>{db.geti('member_limit') or 'illimitato'}</b>\n"
         f"🧊 Cooldown: <b>{db.geti('cooldown')}</b> s\n"
-        f"🛂 Modalità richiesta di ingresso: <b>{'ON (auto-approvata)' if jr else 'OFF'}</b>\n\n"
+        f"🛂 Richiesta di ingresso: <b>{'ON · approvi tu a mano' if jr else 'OFF · ingresso diretto'}</b>\n"
+        f"📨 Avviso all'utente sull'esito: <b>{'ON' if db.geti('notify_user') == 1 else 'OFF'}</b>\n\n"
         "Il resto della chat con l'utente viene cancellato <b>subito</b> dopo l'invio del link."
     )
     rows = [[(lbl, f"adm:num:{k}")] for k, (lbl, _, _) in NUM_META.items()]
-    rows.append([(f"🛂 Richiesta di ingresso: {'ON' if jr else 'OFF'}", "adm:jr")])
+    rows.append([(f"🛂 Approvazione manuale: {'ON' if jr else 'OFF'}", "adm:jr")])
+    rows.append([(f"📨 Avvisa l'utente dell'esito: {'ON' if db.geti('notify_user') == 1 else 'OFF'}", "adm:notif")])
     rows.append([("⬅️ Indietro", "adm:home")])
     return text, ikb(rows)
 
@@ -1354,6 +1444,145 @@ async def a_num_done(m: Message, state: FSMContext):
 
 
 # ──────────────────────── STATISTICHE / ANTEPRIMA ──────────────────
+# ─────────────────── RICHIESTE DI INGRESSO (manuali) ────────────────
+async def process_request(rid: int, approve: bool) -> str:
+    """Accetta/rifiuta UNA richiesta. Ritorna il testo dell'esito (HTML)."""
+    r = db.jr_get(rid)
+    if not r:
+        return "❌ Richiesta non trovata."
+    if r["status"] != "pending":
+        return f"ℹ️ Già gestita ({esc(r['status'])})."
+    try:
+        if approve:
+            await tg(bot.approve_chat_join_request, r["chat_id"], r["user_id"])
+        else:
+            await tg(bot.decline_chat_join_request, r["chat_id"], r["user_id"])
+    except TelegramBadRequest as e:
+        m = str(e).lower()
+        if "already" in m and "participant" in m:
+            db.jr_set(rid, "approved")
+            return "ℹ️ L'utente era già nel gruppo."
+        if "hide_requester_missing" in m or "not found" in m:
+            db.jr_set(rid, "expired")
+            return "⚠️ Richiesta non più valida (ritirata o già gestita altrove)."
+        return f"❌ Errore Telegram: <code>{esc(e)}</code>"
+    except TelegramAPIError as e:
+        return f"❌ Errore: <code>{esc(e)}</code>"
+    db.jr_set(rid, "approved" if approve else "declined")
+    if db.geti("notify_user") == 1:
+        g = db.group_get(r["group_id"]) if r["group_id"] else None
+        label = esc(g["label"]) if g else "il gruppo"
+        txt = (
+            f"✅ La tua richiesta per <b>{label}</b> è stata <b>accettata</b>! Ora sei dentro."
+            if approve else f"❌ La tua richiesta per <b>{label}</b> è stata <b>rifiutata</b>."
+        )
+        with suppress(TelegramAPIError):
+            await bot.send_message(r["user_id"], txt)
+    who = esc(r["first_name"] or r["user_id"])
+    return f"{'✅ Accettato' if approve else '❌ Rifiutato'}: <b>{who}</b>"
+
+
+def reqs_view():
+    total = db.jr_pending_count()
+    items = db.jr_pending(8)
+    text = (
+        "📥 <b>RICHIESTE DI INGRESSO</b>\n\n"
+        f"In attesa: <b>{total}</b>\n"
+        "Nessuna accettazione automatica: decidi tu.\n\n"
+    )
+    rows = []
+    if not items:
+        text += "<i>Nessuna richiesta in sospeso.</i>"
+    for r in items:
+        g = db.group_get(r["group_id"]) if r["group_id"] else None
+        name = r["first_name"] or str(r["user_id"])
+        uname = f" (@{esc(r['username'])})" if r["username"] else ""
+        text += (
+            f'• <a href="tg://user?id={r["user_id"]}">{esc(name)}</a>{uname} → '
+            f'{esc(g["label"] if g else "?")} · {fmt_ts(r["created"])}\n'
+        )
+        rows.append([(f"✅ {name}"[:28], f"jrl:ok:{r['id']}"), (f"❌ {name}"[:28], f"jrl:no:{r['id']}")])
+    if total > len(items):
+        text += f"\n… e altre <b>{total - len(items)}</b> richieste."
+    if total:
+        rows.append([("✅ Accetta tutte", "adm:reqbulk:ok"), ("❌ Rifiuta tutte", "adm:reqbulk:no")])
+    rows.append([("🔄 Aggiorna", "adm:reqs")])
+    rows.append([("⬅️ Indietro", "adm:home")])
+    return text, ikb(rows)
+
+
+@admin_router.callback_query(F.data == "adm:reqs")
+async def a_reqs(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.answer()
+    t, k = reqs_view()
+    await safe_edit(cb, t, k)
+
+
+@admin_router.callback_query(F.data.startswith("jr:"))
+async def a_jr_action(cb: CallbackQuery):
+    """Bottoni Accetta/Rifiuta sul messaggio di avviso."""
+    try:
+        _, act, rid = cb.data.split(":")
+        rid = int(rid)
+    except ValueError:
+        return await cb.answer()
+    res = await process_request(rid, act == "ok")
+    await cb.answer(strip_tags(res)[:190])
+    base = getattr(cb.message, "html_text", "") or ""
+    await safe_edit(cb, f"{base}\n\n{res}", None)
+
+
+@admin_router.callback_query(F.data.startswith("jrl:"))
+async def a_jrl_action(cb: CallbackQuery):
+    """Bottoni Accetta/Rifiuta nella lista 📥 Richieste."""
+    try:
+        _, act, rid = cb.data.split(":")
+        rid = int(rid)
+    except ValueError:
+        return await cb.answer()
+    res = await process_request(rid, act == "ok")
+    await cb.answer(strip_tags(res)[:190])
+    t, k = reqs_view()
+    await safe_edit(cb, t, k)
+
+
+@admin_router.callback_query(F.data.startswith("adm:reqbulk:"))
+async def a_req_bulk(cb: CallbackQuery):
+    act = cb.data.split(":")[2]
+    n = db.jr_pending_count()
+    await cb.answer()
+    verb = "ACCETTARE" if act == "ok" else "RIFIUTARE"
+    await safe_edit(
+        cb, f"⚠️ Vuoi davvero <b>{verb} tutte</b> le <b>{n}</b> richieste in attesa?",
+        ikb([[("✅ Sì, conferma", f"adm:reqbulkgo:{act}"), ("❌ Annulla", "adm:reqs")]]),
+    )
+
+
+@admin_router.callback_query(F.data.startswith("adm:reqbulkgo:"))
+async def a_req_bulk_go(cb: CallbackQuery):
+    act = cb.data.split(":")[2]
+    await cb.answer("Elaboro…")
+    ok = bad = 0
+    for r in db.jr_pending_all():
+        res = await process_request(r["id"], act == "ok")
+        if res.startswith(("✅", "❌ Rifiutato", "ℹ️")):
+            ok += 1
+        else:
+            bad += 1
+        await asyncio.sleep(0.35)
+    t, k = reqs_view()
+    await safe_edit(cb, f"Completato: ✅ {ok} · ⚠️ {bad}\n\n" + t, k)
+
+
+@admin_router.callback_query(F.data == "adm:notif")
+async def a_notif(cb: CallbackQuery):
+    db.set("notify_user", "0" if db.geti("notify_user") == 1 else "1")
+    await cb.answer("Aggiornato")
+    t, k = settings_view()
+    await safe_edit(cb, t, k)
+
+
 @admin_router.callback_query(F.data == "adm:stats")
 async def a_stats(cb: CallbackQuery):
     await cb.answer()
@@ -1366,7 +1595,8 @@ async def a_stats(cb: CallbackQuery):
         f"🚫 Hanno bloccato il bot: <b>{s['blocked']}</b>\n\n"
         f"🔗 Link generati: <b>{s['links']}</b>\n"
         f"🔗 Link (24h): <b>{s['links24']}</b>\n"
-        f"🟢 Link attivi ora: <b>{s['active_links']}</b>\n\n"
+        f"🟢 Link attivi ora: <b>{s['active_links']}</b>\n"
+        f"📥 Richieste in attesa: <b>{db.jr_pending_count()}</b>\n\n"
         f"📂 Gruppi attivi: <b>{s['groups']}</b>\n"
         f"😀 Emoji premium: <b>{s['emojis']}</b>\n\n"
     )
@@ -1407,6 +1637,9 @@ async def a_help(cb: CallbackQuery):
         "<b>Emoji premium:</b> le emoji custom nei messaggi del bot richiedono che l'account "
         "proprietario del bot abbia Telegram Premium o username acquistati su Fragment "
         "(regola di Telegram). Se non disponibile, il bot mostra l'emoji normale di ripiego.\n\n"
+        "<b>Richieste di ingresso:</b> con «Approvazione manuale» ON il bot <u>non accetta mai da solo</u>: "
+        "ti manda un avviso con ✅ Accetta / ❌ Rifiuta e le trovi tutte in 📥 Richieste. "
+        "Puoi anche gestirle dalla lista «Richieste di iscrizione» del gruppo in Telegram.\n\n"
         "<b>Comandi:</b> /admin · /cancel · /ban ID · /unban ID\n"
         "<b>Deep-link per gruppo:</b> dentro la scheda del gruppo."
     )
