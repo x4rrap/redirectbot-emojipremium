@@ -1,0 +1,14 @@
+# Requisiti per userbot.py  (Python 3.9 o superiore)
+# Installazione:  pip install -r requirements.txt
+
+# Libreria Telegram (serve la serie 1.x: la 2.x ha API diverse)
+telethon>=1.36,<2
+
+# Chiamate web (AI testo/immagini, meteo, crypto, valute, QR)
+aiohttp>=3.9
+
+# Fusi orari per il comando .time (necessario su Windows)
+tzdata
+
+# Facoltativo: velocizza upload/download dei file. Decommenta se vuoi.
+# cryptg
